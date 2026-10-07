@@ -19,7 +19,7 @@ from calling_agent.telnyx import (
     telnyx_transcription_start,
     verify_telnyx_signature,
 )
-from calling_agent.tts import close_session_stt, preconnect_listen
+from calling_agent.tts import close_session_stt
 
 # Hangups that mean the callee never had a real conversation.
 _FAILED_HANGUPS = frozenset({
@@ -52,18 +52,8 @@ async def _start_transcription(ccid: str) -> None:
     except Exception as e:
         fail("transcription_start_failed", str(e), ccid=ccid)
     try:
-        await telnyx_post(
-            f"/calls/{ccid}/actions/transcription_start",
-            {
-                "transcription_engine": "Telnyx",
-                "transcription_engine_config": {
-                    "transcription_engine": "Telnyx",
-                    "language": "en",
-                },
-                "transcription_tracks": "inbound",
-            },
-        )
-        log(f"[{ccid}] transcription started (Telnyx engine)")
+        await telnyx_transcription_start(ccid)
+        log(f"[{ccid}] transcription started (Deepgram fallback)")
     except Exception as e:
         fail("transcription_fallback_failed", str(e), ccid=ccid)
 
@@ -218,21 +208,28 @@ async def telnyx_webhook(request: Request):
         if session:
             session.connected_at = time.monotonic()
             session.answered_at = time.monotonic()
+            # Claim speech ownership before media WS connects (avoids dual play).
+            session.conversation_active = True
             asyncio.create_task(conversation.start(session, ccid))
         else:
             fail("answered_no_session", "answered webhook with no CallSession", ccid=ccid)
 
-        asyncio.create_task(_start_transcription(ccid))
         if config.CALL_RECORDING:
             asyncio.create_task(_start_recording(ccid))
 
-        # Optional debug path only — campaign calls use Telnyx playback.
+        # MEDIA_STREAM: inbound RTP → Deepgram Listen (nova-2-phonecall).
+        # Otherwise: Telnyx-hosted transcription (Deepgram nova-2/nova-3).
         if config.MEDIA_STREAM:
-            if session and session.dg_connect_task is None:
-                session.dg_connect_task = asyncio.create_task(
-                    preconnect_listen(session, ccid)
-                )
+            log(
+                f"[{ccid}] STT via media stream + Deepgram "
+                f"{config.DEEPGRAM_LISTEN_MODEL}"
+            )
+            # Open Listen when the media WS starts (not on answer). Preconnecting
+            # left the socket idle through the greeting; Deepgram closed it
+            # (~10s) before Telnyx sent the first inbound frame.
             asyncio.create_task(_start_media_stream(ccid))
+        else:
+            asyncio.create_task(_start_transcription(ccid))
 
     elif event == "streaming.failed":
         fail("streaming_failed", json.dumps(payload), ccid=ccid)

@@ -79,6 +79,12 @@ TELNYX_PUBLIC_KEY = ENV.get("TELNYX_PUBLIC_KEY", "")
 
 DEEPGRAM_TTS_URL = "https://api.deepgram.com/v1/speak"
 DEEPGRAM_LISTEN_URL = "wss://api.deepgram.com/v1/listen"
+# Direct Deepgram Listen model (media websocket path). nova-2-phonecall is
+# best for 8 kHz telephony; Telnyx transcription_start cannot select it.
+DEEPGRAM_LISTEN_MODEL = (
+    os.environ.get("DEEPGRAM_LISTEN_MODEL", "nova-2-phonecall").strip()
+    or "nova-2-phonecall"
+)
 TELNYX_API = "https://api.telnyx.com/v2"
 VOICE = "aura-2-thalia-en"
 
@@ -173,6 +179,8 @@ STT_UTTERANCE_END_MS = max(
 # when the Cloudflare tunnel dropped that socket; speech now goes through
 # Telnyx playback_start. Keep the WS off unless you are debugging inbound RTP.
 MEDIA_STREAM = os.environ.get("MEDIA_STREAM", "0").strip() in ("1", "true", "yes")
+# Learn novel unclear replies: LLM answer → Deepgram TTS → SQLite + audio cache.
+SITUATION_CACHE = os.environ.get("SITUATION_CACHE", "1").strip() in ("1", "true", "yes")
 # Debug-only: echo inbound RTP back out on the media WebSocket.
 ECHO_TEST = os.environ.get("ECHO_TEST", "0").strip() in ("1", "true", "yes")
 
@@ -183,6 +191,15 @@ CALL_RECORDING_FORMAT = os.environ.get("CALL_RECORDING_FORMAT", "mp3").strip() o
 CALL_RECORDING_CHANNELS = (
     os.environ.get("CALL_RECORDING_CHANNELS", "dual").strip() or "dual"
 )
+
+# Live STT via Telnyx transcription_start.
+# Ranked for this dialer: Deepgram deepgram/nova-2 (or nova-3) >> Google.
+# Telnyx does not expose Deepgram's "nova-2-phonecall"; that needs MEDIA_STREAM.
+TRANSCRIPTION_ENGINE = os.environ.get("TRANSCRIPTION_ENGINE", "Deepgram").strip() or "Deepgram"
+TRANSCRIPTION_MODEL = (
+    os.environ.get("TRANSCRIPTION_MODEL", "deepgram/nova-2").strip() or "deepgram/nova-2"
+)
+TRANSCRIPTION_LANGUAGE = os.environ.get("TRANSCRIPTION_LANGUAGE", "en").strip() or "en"
 
 # Inbound audio diagnostics
 AUDIO_LEVEL_LOG_S = float(os.environ.get("AUDIO_LEVEL_LOG_S", "2.0"))

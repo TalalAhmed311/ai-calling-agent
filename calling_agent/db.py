@@ -60,6 +60,23 @@ def init() -> None:
                 );
                 CREATE INDEX IF NOT EXISTS idx_leads_campaign ON leads(campaign_id, status);
                 CREATE INDEX IF NOT EXISTS idx_leads_ccid ON leads(call_control_id);
+
+                CREATE TABLE IF NOT EXISTS situations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    node TEXT NOT NULL,
+                    situation_key TEXT NOT NULL,
+                    user_text TEXT NOT NULL,
+                    reply_text TEXT NOT NULL,
+                    clip_id TEXT NOT NULL,
+                    hit_count INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(node, situation_key)
+                );
+                CREATE INDEX IF NOT EXISTS idx_situations_node_key
+                    ON situations(node, situation_key);
+                CREATE INDEX IF NOT EXISTS idx_situations_clip
+                    ON situations(clip_id);
                 """
             )
             try:
@@ -67,6 +84,113 @@ def init() -> None:
             except sqlite3.OperationalError:
                 pass
             conn.commit()
+        finally:
+            conn.close()
+
+
+def get_situation(node: str, situation_key: str) -> dict[str, Any] | None:
+    with _LOCK:
+        conn = connect()
+        try:
+            row = conn.execute(
+                "SELECT * FROM situations WHERE node = ? AND situation_key = ?",
+                (node, situation_key),
+            ).fetchone()
+            return _row(row)
+        finally:
+            conn.close()
+
+
+def find_situation_fuzzy(node: str, situation_key: str, limit: int = 40) -> dict[str, Any] | None:
+    """Exact key first, then substring / containment match within the node."""
+    exact = get_situation(node, situation_key)
+    if exact:
+        return exact
+    if len(situation_key) < 8:
+        return None
+    with _LOCK:
+        conn = connect()
+        try:
+            rows = conn.execute(
+                "SELECT * FROM situations WHERE node = ? ORDER BY hit_count DESC, id DESC LIMIT ?",
+                (node, limit),
+            ).fetchall()
+        finally:
+            conn.close()
+    for row in rows:
+        d = _row(row)
+        if not d:
+            continue
+        key = str(d.get("situation_key") or "")
+        if not key:
+            continue
+        if key in situation_key or situation_key in key:
+            return d
+    return None
+
+
+def upsert_situation(
+    *,
+    node: str,
+    situation_key: str,
+    user_text: str,
+    reply_text: str,
+    clip_id: str,
+) -> dict[str, Any]:
+    now = _now()
+    with _LOCK:
+        conn = connect()
+        try:
+            conn.execute(
+                """
+                INSERT INTO situations
+                    (node, situation_key, user_text, reply_text, clip_id,
+                     hit_count, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, 0, ?, ?)
+                ON CONFLICT(node, situation_key) DO UPDATE SET
+                    user_text = excluded.user_text,
+                    reply_text = excluded.reply_text,
+                    clip_id = excluded.clip_id,
+                    updated_at = excluded.updated_at
+                """,
+                (node, situation_key, user_text, reply_text, clip_id, now, now),
+            )
+            conn.commit()
+            row = conn.execute(
+                "SELECT * FROM situations WHERE node = ? AND situation_key = ?",
+                (node, situation_key),
+            ).fetchone()
+            return _row(row) or {}
+        finally:
+            conn.close()
+
+
+def bump_situation_hit(situation_id: int) -> None:
+    with _LOCK:
+        conn = connect()
+        try:
+            conn.execute(
+                """
+                UPDATE situations
+                SET hit_count = hit_count + 1, updated_at = ?
+                WHERE id = ?
+                """,
+                (_now(), situation_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def list_situations(limit: int = 500) -> list[dict[str, Any]]:
+    with _LOCK:
+        conn = connect()
+        try:
+            rows = conn.execute(
+                "SELECT * FROM situations ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+            return [_row(r) for r in rows if r is not None]
         finally:
             conn.close()
 

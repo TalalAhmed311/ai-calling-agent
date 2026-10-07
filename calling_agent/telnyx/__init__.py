@@ -91,15 +91,69 @@ async def telnyx_speak(ccid: str, text: str, command_id: str | None = None) -> d
 
 
 async def telnyx_transcription_start(ccid: str) -> dict:
+    """Start inbound STT.
+
+    For live phone agents via Telnyx Call Control, use Deepgram
+    ``deepgram/nova-2`` or ``deepgram/nova-3`` (not Google). Telnyx expects
+    ``transcription_model``, not a bare ``model`` field.
+    """
+    engine = (config.TRANSCRIPTION_ENGINE or "Deepgram").strip()
+    language = (config.TRANSCRIPTION_LANGUAGE or "en").strip()
+    model = (config.TRANSCRIPTION_MODEL or "deepgram/nova-2").strip()
+    if engine.lower() == "deepgram" and not model.startswith("deepgram/"):
+        model = f"deepgram/{model}"
+
+    if engine.lower() == "deepgram":
+        engine_config: dict = {
+            "transcription_engine": "Deepgram",
+            "transcription_model": model,
+            "language": language,
+            "interim_results": False,
+            "smart_format": True,
+            # Bias toward the words we ask for on every call.
+            "keywords_boosting": {
+                "owner": 5,
+                "manager": 5,
+                "owners": 3,
+                "CraftPay": 3,
+            },
+            "hints": [
+                "owner",
+                "manager",
+                "I'm the owner",
+                "I'm the manager",
+                "not interested",
+                "call back",
+            ],
+        }
+        # Nova-3 uses keyterms instead of keywords_boosting/hints.
+        if "nova-3" in model:
+            engine_config.pop("keywords_boosting", None)
+            engine_config.pop("hints", None)
+            engine_config["keyterms"] = [
+                "owner",
+                "manager",
+                "I'm the owner",
+                "I'm the manager",
+                "CraftPay",
+            ]
+    elif engine.lower() == "google":
+        engine_config = {
+            "transcription_engine": "Google",
+            "language": language,
+            "interim_results": False,
+        }
+    else:
+        engine_config = {
+            "transcription_engine": engine,
+            "language": language,
+        }
+
     return await telnyx_post(
         f"/calls/{ccid}/actions/transcription_start",
         {
-            "transcription_engine": "Google",
-            "transcription_engine_config": {
-                "transcription_engine": "Google",
-                "language": "en",
-                "interim_results": False,
-            },
+            "transcription_engine": engine,
+            "transcription_engine_config": engine_config,
             "transcription_tracks": "inbound",
         },
     )

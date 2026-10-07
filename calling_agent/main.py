@@ -5,10 +5,11 @@ from __future__ import annotations
 import httpx
 from fastapi import FastAPI
 
-from calling_agent import config, dialer, runtime
+from calling_agent import config, dialer, runtime, situations
 from calling_agent.api import router
 from calling_agent.api.campaigns import router as campaigns_router
 from calling_agent.cache import bake_clips
+from calling_agent.db import init as db_init
 from calling_agent.log import fail, log
 from calling_agent.media import media_bridge
 from calling_agent.tts import HTTP, synthesize
@@ -40,11 +41,20 @@ async def warmup() -> None:
     except Exception as e:
         print(f"warmup telnyx ping: {e}")
 
+    db_init()
     try:
         await bake_clips(runtime.AUDIO_CACHE, runtime.CLIP_TEXTS, synthesize, force=False)
     except Exception as e:
         fail("cache_bake_failed", str(e))
         raise
+    if config.SITUATION_CACHE:
+        try:
+            n = await situations.warmup_from_db()
+            log(f"[situation] enabled — {n} learned replies loaded")
+        except Exception as e:
+            fail("situation_warmup_failed", str(e))
+    else:
+        log("[situation] disabled")
     log(f"[cache] ready — {len(runtime.CLIP_TEXTS)} clips x 2 encodings")
     log(
         f"[speech] Telnyx playback ({len(runtime.AUDIO_CACHE.wavs)} wav clips); "

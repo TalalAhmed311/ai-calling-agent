@@ -14,31 +14,45 @@ class Node:
 NODES: dict[str, Node] = {
     "await_role": Node(
         "await_role",
-        ("owner", "manager", "neither", "who_is_this", "not_interested",
-         "do_not_call", "machine", "unclear"),
+        ("owner", "manager", "neither", "who_is_this", "are_you_ai",
+         "not_interested", "do_not_call", "machine", "unclear"),
     ),
     "await_two_minutes": Node(
         "await_two_minutes",
-        ("yes_now", "busy", "not_interested", "do_not_call", "machine", "unclear"),
+        ("yes_now", "busy", "are_you_ai", "who_is_this",
+         "not_interested", "do_not_call", "machine", "unclear"),
     ),
     "await_interest": Node(
         "await_interest",
-        ("interested", "maybe", "not_interested", "busy", "do_not_call",
-         "machine", "unclear"),
+        ("interested", "maybe", "not_interested", "busy", "are_you_ai",
+         "who_is_this", "do_not_call", "machine", "unclear"),
     ),
     "await_callback_time": Node(
         "await_callback_time",
-        ("callback_time", "not_interested", "do_not_call", "machine", "unclear"),
+        ("callback_time", "are_you_ai", "who_is_this",
+         "not_interested", "do_not_call", "machine", "unclear"),
     ),
     "await_gatekeeper_time": Node(
         "await_gatekeeper_time",
-        ("callback_time", "not_interested", "do_not_call", "machine", "unclear"),
+        ("callback_time", "are_you_ai", "who_is_this",
+         "not_interested", "do_not_call", "machine", "unclear"),
     ),
     "await_busy_time": Node(
         "await_busy_time",
-        ("callback_time", "not_interested", "do_not_call", "machine", "unclear"),
+        ("callback_time", "are_you_ai", "who_is_this",
+         "not_interested", "do_not_call", "machine", "unclear"),
     ),
     "ended": Node("ended", (), listen=False, barge_in=False),
+}
+
+# After answering a meta question, re-ask the node’s main question.
+_REQUEUE_CLIPS: dict[str, list[str]] = {
+    "await_role": ["probe_role"],
+    "await_two_minutes": ["ask_two_minutes"],
+    "await_interest": ["ask_interest"],
+    "await_callback_time": ["ask_callback_time"],
+    "await_gatekeeper_time": ["ask_owner_manager_time"],
+    "await_busy_time": ["busy_ask_better_time"],
 }
 
 
@@ -89,6 +103,35 @@ def transition(node_id: str, intent: str, confidence: float, slots: dict | None 
             slots=slots,
         )
 
+    # Meta / side questions: answer, stay on node, re-ask (don't burn a probe).
+    if intent == "are_you_ai":
+        requeue = _REQUEUE_CLIPS.get(node_id, ["probe_unclear"])
+        return Decision(
+            intent=intent,
+            confidence=confidence,
+            next_node=node_id,
+            play=["disclose_ai", *requeue],
+            slots=slots,
+        )
+    if intent == "who_is_this":
+        # identify_company already re-asks role; elsewhere identify + requeue.
+        if node_id == "await_role":
+            return Decision(
+                intent=intent,
+                confidence=confidence,
+                next_node="await_role",
+                play=["identify_company"],
+                slots=slots,
+            )
+        requeue = _REQUEUE_CLIPS.get(node_id, ["probe_unclear"])
+        return Decision(
+            intent=intent,
+            confidence=confidence,
+            next_node=node_id,
+            play=["identify_brief", *requeue],
+            slots=slots,
+        )
+
     if node_id == "await_role":
         if intent in ("owner", "manager"):
             return Decision(
@@ -105,14 +148,6 @@ def transition(node_id: str, intent: str, confidence: float, slots: dict | None 
                 next_node="await_gatekeeper_time",
                 play=["ask_owner_manager_time"],
                 disposition="not_decision_maker",
-                slots=slots,
-            )
-        if intent == "who_is_this":
-            return Decision(
-                intent=intent,
-                confidence=confidence,
-                next_node="await_role",
-                play=["identify_company"],
                 slots=slots,
             )
         return Decision(

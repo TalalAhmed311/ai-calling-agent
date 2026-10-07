@@ -11,7 +11,7 @@ import json
 import time
 import uuid
 
-from calling_agent import config, runtime
+from calling_agent import config, runtime, situations
 from calling_agent.cache.wav import wav_duration_s
 from calling_agent.decide import MAX_PROBES_PER_NODE, decide, decision_log
 from calling_agent.graph.nodes import Decision
@@ -68,9 +68,66 @@ async def stop_playback(ccid: str, session: CallSession) -> None:
     await telnyx_playback_stop(ccid)
 
 
+# STT often turns "I'm owner" into "I'm done" on phone audio.
+_OWNER_DONE_CONFUSIONS = (
+    "i'm done",
+    "im done",
+    "i am done",
+    "i done",
+    "am done",
+)
+_AI_QUESTION_PHRASES = (
+    "are you an ai",
+    "are you ai",
+    "are you a robot",
+    "are you a bot",
+    "is this an ai",
+    "is this ai",
+    "is this a robot",
+    "is this a recording",
+    "are you real",
+    "are you a real person",
+    "am i talking to an ai",
+    "am i speaking to an ai",
+    "is this automated",
+    "are you automated",
+)
+_WHO_IS_THIS_PHRASES = (
+    "who is this",
+    "who's this",
+    "who am i speaking",
+    "who am i talking",
+    "what company",
+    "where are you calling from",
+)
+
+_OWNER_PHRASES = (
+    "owner",
+    "i'm the owner",
+    "im the owner",
+    "i am the owner",
+    "i'm owner",
+    "im owner",
+    "i am owner",
+    "this is the owner",
+    "speaking with the owner",
+)
+_MANAGER_PHRASES = (
+    "manager",
+    "i'm the manager",
+    "im the manager",
+    "i am the manager",
+    "i'm manager",
+    "im manager",
+)
+
+
 def _quick_decision(session: CallSession, text: str) -> Decision | None:
-    """Bypass LLM for common IVR / gatekeeper openers."""
+    """Bypass LLM for common IVR / gatekeeper openers / role answers."""
+    from calling_agent.graph.nodes import transition
+
     low = " ".join((text or "").lower().split())
+    low = low.strip(" .,!?")
     if not low:
         return None
     if any(p in low for p in _IVR_PHRASES):
@@ -82,27 +139,57 @@ def _quick_decision(session: CallSession, text: str) -> Decision | None:
             end_call=True,
             disposition="IVR_OR_MACHINE",
         )
-    if session.node == "await_role" and any(p in low for p in _GATEKEEPER_OPENERS):
-        return Decision(
-            intent="neither",
-            confidence=0.85,
-            next_node="await_gatekeeper_time",
-            play=["ask_owner_manager_time"],
-            disposition="not_decision_maker",
-        )
-    if session.node == "await_role" and low in ("hello", "hi", "hey", "yes", "yeah", "yep"):
-        # They picked up; re-ask role once instead of generic unclear loop.
-        return Decision(
-            intent="unclear",
-            confidence=0.6,
-            next_node="await_role",
-            play=["probe_role"],
-        )
+    # Side questions can land on any listening node — answer, stay, re-ask.
+    if any(p in low for p in _AI_QUESTION_PHRASES):
+        return transition(session.node, "are_you_ai", 0.95)
+    if any(p in low for p in _WHO_IS_THIS_PHRASES):
+        return transition(session.node, "who_is_this", 0.9)
+    if session.node == "await_role":
+        # Explicit owner/manager before LLM (handles partial STT).
+        if any(p in low for p in _OWNER_PHRASES) or low in ("owner", "the owner"):
+            return Decision(
+                intent="owner",
+                confidence=0.9,
+                next_node="await_two_minutes",
+                play=["perfect_thanks", "ask_two_minutes"],
+            )
+        if any(p in low for p in _MANAGER_PHRASES) or low in ("manager", "the manager"):
+            return Decision(
+                intent="manager",
+                confidence=0.9,
+                next_node="await_two_minutes",
+                play=["perfect_thanks", "ask_two_minutes"],
+            )
+        # "I'm done" right after "are you the owner?" is almost always a mishear of "I'm owner".
+        if low in _OWNER_DONE_CONFUSIONS or low.rstrip(".") in _OWNER_DONE_CONFUSIONS:
+            return Decision(
+                intent="unclear",
+                confidence=0.55,
+                next_node="await_role",
+                play=["probe_role"],
+            )
+        if any(p in low for p in _GATEKEEPER_OPENERS):
+            return Decision(
+                intent="neither",
+                confidence=0.85,
+                next_node="await_gatekeeper_time",
+                play=["ask_owner_manager_time"],
+                disposition="not_decision_maker",
+            )
+        if low in ("hello", "hi", "hey", "yes", "yeah", "yep"):
+            return Decision(
+                intent="unclear",
+                confidence=0.6,
+                next_node="await_role",
+                play=["probe_role"],
+            )
     return None
 
 
 def _cap_probes(session: CallSession, d: Decision) -> Decision:
     """After MAX_PROBES unclear probes, exit instead of looping."""
+    if d.intent in ("are_you_ai", "who_is_this", "situation_reply"):
+        return d
     probing = d.play in (["probe_role"], ["probe_unclear"]) or (
         d.intent == "unclear" and not d.end_call and not d.disposition
     )
@@ -115,6 +202,34 @@ def _cap_probes(session: CallSession, d: Decision) -> Decision:
             end_call=True,
             disposition="no_decision",
             slots=d.slots,
+        )
+    return d
+
+
+def _guard_false_not_interested(session: CallSession, text: str, d: Decision) -> Decision:
+    """Don't hang up on thin not_interested after the role question."""
+    if d.intent != "not_interested" or not d.end_call:
+        return d
+    if session.node != "await_role":
+        return d
+    low = " ".join((text or "").lower().split()).strip(" .,!?")
+    # Short / ambiguous rejects right after "owner or manager?" — clarify once.
+    thin = low in _OWNER_DONE_CONFUSIONS or low in (
+        "done",
+        "no",
+        "nah",
+        "what",
+        "huh",
+        "i don't know",
+        "dont know",
+        "don't know",
+    )
+    if thin:
+        return Decision(
+            intent="unclear",
+            confidence=0.5,
+            next_node="await_role",
+            play=["probe_role"],
         )
     return d
 
@@ -186,6 +301,27 @@ async def _play_one(session: CallSession, ccid: str, clip_id: str, text: str) ->
         session.playback_done.set()
 
 
+async def _decide_turn(session: CallSession, text: str) -> Decision:
+    """Classify the user turn; learn a cached reply when the graph would probe."""
+    d = _quick_decision(session, text)
+    if d is None:
+        d = await decide(session.node, text, probes_used=session.probes_used)
+        d = _guard_false_not_interested(session, text, d)
+    d = _cap_probes(session, d)
+
+    # Novel side-questions / unclear speech → DB lookup or LLM+TTS cache.
+    if (
+        config.SITUATION_CACHE
+        and d.intent == "unclear"
+        and not d.end_call
+        and d.play in (["probe_unclear"], ["probe_role"])
+    ):
+        resolved = await situations.resolve(session.node, text)
+        if resolved:
+            d = situations.decision_from_resolve(session.node, resolved)
+    return d
+
+
 async def handle_user_text(session: CallSession, ccid: str, text: str) -> None:
     text = (text or "").strip()
     if not text or session.ended:
@@ -205,16 +341,16 @@ async def handle_user_text(session: CallSession, ccid: str, text: str) -> None:
         if session.ended or session.node == "ended":
             return
         t_decide = time.monotonic()
-        d = _quick_decision(session, text)
-        if d is None:
-            d = await decide(session.node, text, probes_used=session.probes_used)
-        d = _cap_probes(session, d)
+        d = await _decide_turn(session, text)
         log(
             f"[{ccid}] decide {json.dumps(decision_log(d))} "
             f"in {time.monotonic() - t_decide:.3f}s"
         )
 
-        if d.intent == "unclear" or d.play == ["probe_role"] or d.play == ["probe_unclear"]:
+        if d.intent in ("are_you_ai", "who_is_this", "situation_reply"):
+            # Meta / learned answers shouldn't burn the unclear-probe budget.
+            pass
+        elif d.intent == "unclear" or d.play == ["probe_role"] or d.play == ["probe_unclear"]:
             session.probes_used += 1
         else:
             session.probes_used = 0

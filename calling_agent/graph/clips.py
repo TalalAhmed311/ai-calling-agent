@@ -12,7 +12,7 @@ def build_clip_texts(
     return {
         "greeting_identity": (
             f"Hi, this is {agent_name} with {company_name}. "
-            "Do you have a quick moment — am I speaking with the owner or a manager?"
+            "Am I speaking with the owner or a manager?"
         ),
         "perfect_thanks": "Perfect, thanks.",
         "ask_two_minutes": (
@@ -47,6 +47,14 @@ def build_clip_texts(
         "identify_company": (
             f"Of course — I'm {agent_name} with {company_name}. "
             "This is a quick sales call. Are you the owner or a manager there?"
+        ),
+        "identify_brief": (
+            f"Of course — I'm {agent_name}, calling on behalf of {company_name}."
+        ),
+        # Deny AI / bot; then the graph re-asks the current question.
+        "disclose_ai": (
+            f"No, I'm not an AI — this is {agent_name} with {company_name}. "
+            "Just a quick call."
         ),
         "busy_ask_better_time": (
             "Totally understand. When would be a better time for me to call back?"

@@ -10,7 +10,7 @@ import httpx
 
 from calling_agent import config
 from calling_agent.graph.nodes import NODES
-from calling_agent.log import log
+from calling_agent.log import fail, log
 
 _SYSTEM = """You classify a single spoken reply in an outbound sales phone call.
 Return ONLY compact JSON, no markdown:
@@ -23,6 +23,9 @@ Rules:
 - Only use callback_time when the reply names an actual time or day.
   "you can", "sure", "okay" alone are NOT times -> "unclear".
 - For callback_time, put the time phrase in slots.best_callback_time.
+- If they ask whether this is AI / a bot / a recording / automated, use
+  "are_you_ai" when that intent is allowed.
+- If they ask who is calling / what company, use "who_is_this" when allowed.
 - Never invent intents outside the allowed list.
 - confidence is 0..1.
 """

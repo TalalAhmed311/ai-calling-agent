@@ -17,20 +17,23 @@ HTTP: httpx.AsyncClient | None = None
 
 
 def listen_url(encoding: str, sample_rate: int = 8000) -> str:
-    qs = urlencode({
-        "model": "nova-2-phonecall",
-        "encoding": encoding,
-        "sample_rate": sample_rate,
-        "channels": 1,
-        "punctuate": "true",
-        # utterance_end_ms is only accepted alongside interim results; sending
-        # it with interim_results=false makes Deepgram reject the handshake 400.
-        "interim_results": "true",
-        "endpointing": config.STT_ENDPOINTING_MS,
-        "utterance_end_ms": config.STT_UTTERANCE_END_MS,
-        "mip_opt_out": "true",
-    })
-    return f"{config.DEEPGRAM_LISTEN_URL}?{qs}"
+    # keywords as repeated query keys for Deepgram boost (owner/manager).
+    pairs = [
+        ("model", config.DEEPGRAM_LISTEN_MODEL),
+        ("encoding", encoding),
+        ("sample_rate", str(sample_rate)),
+        ("channels", "1"),
+        ("punctuate", "true"),
+        # utterance_end_ms only valid with interim_results=true.
+        ("interim_results", "true"),
+        ("endpointing", str(config.STT_ENDPOINTING_MS)),
+        ("utterance_end_ms", str(config.STT_UTTERANCE_END_MS)),
+        ("mip_opt_out", "true"),
+        ("keywords", "owner:5"),
+        ("keywords", "manager:5"),
+        ("keywords", "I'm the owner:4"),
+    ]
+    return f"{config.DEEPGRAM_LISTEN_URL}?{urlencode(pairs)}"
 
 
 async def synthesize(text: str, encoding: str = "mulaw", sample_rate: int = 8000) -> bytes:

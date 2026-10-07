@@ -13,12 +13,251 @@ from fastapi import WebSocket, WebSocketDisconnect
 from calling_agent import config, conversation, runtime
 from calling_agent.amd import telnyx_encoding_to_deepgram
 from calling_agent.cache import PlayQueue
-from calling_agent.decide import decide, decision_log
+from calling_agent.decide import decision_log
 from calling_agent.log import fail, log
 from calling_agent.media.levels import describe_level
 from calling_agent.session import SESSIONS, CallSession
 from calling_agent.telnyx import telnyx_hangup
 from calling_agent.tts import close_session_stt, listen_url
+
+
+async def _open_listen(ccid: str, encoding: str, sample_rate: int):
+    t_stt = time.monotonic()
+    ws = await asyncio.wait_for(
+        websockets.connect(
+            listen_url(encoding, sample_rate),
+            additional_headers={
+                "Authorization": f"Token {config.DEEPGRAM_API_KEY}"
+            },
+            open_timeout=8,
+        ),
+        timeout=10.0,
+    )
+    log(
+        f"[{ccid}] STT-only: Deepgram Listen "
+        f"model={config.DEEPGRAM_LISTEN_MODEL} ({encoding}) "
+        f"in {time.monotonic() - t_stt:.3f}s"
+    )
+    return ws
+
+
+async def _run_stt_only(
+    *,
+    session: CallSession,
+    state: dict[str, Any],
+    stt_queue: asyncio.Queue[bytes | None],
+    reader: asyncio.Task,
+    media_epoch: int,
+) -> None:
+    """Inbound media → Deepgram Listen → conversation.handle_user_text.
+
+    Agent speech stays on Telnyx playback (conversation engine); this path only
+    supplies STT so we can use models Telnyx transcription_start cannot select
+    (e.g. nova-2-phonecall).
+
+    Deepgram closes idle Listen sockets after ~10s. Telnyx often delays the first
+    inbound media frame until after our greeting, so we KeepAlive and reopen
+    if the socket dies while the call is still live.
+    """
+    encoding = state["encoding"]
+    sample_rate = state["sample_rate"]
+    ccid = state["ccid"]
+
+    dg_ws = session.dg_ws
+    if dg_ws is not None and session.dg_encoding == encoding:
+        log(f"[{ccid}] STT-only: reusing preconnected Deepgram Listen ({encoding})")
+        session.dg_ws = None
+    else:
+        if dg_ws is not None:
+            log(
+                f"[{ccid}] STT-only: preconnect encoding "
+                f"{session.dg_encoding} != {encoding}; reopening"
+            )
+        await close_session_stt(session)
+        try:
+            dg_ws = await _open_listen(ccid, encoding, sample_rate)
+        except Exception as e:
+            log(f"[{ccid}] STT-only: Deepgram Listen open failed: {e}")
+            fail("listen_open_failed", str(e), ccid=ccid, encoding=encoding)
+            reader.cancel()
+            return
+
+    if session.media_owner != media_epoch or session.ended:
+        log(f"[{ccid}] STT-only: media epoch superseded — exiting")
+        try:
+            await dg_ws.close()
+        except Exception:
+            pass
+        reader.cancel()
+        return
+
+    # Mutable handle so sender/keepalive follow reconnects.
+    dg: dict[str, Any] = {"ws": dg_ws}
+    stop = asyncio.Event()
+    state["listen_open"] = True
+    log(f"[{ccid}] STT-only mic open — model={config.DEEPGRAM_LISTEN_MODEL}")
+
+    async def stt_sender():
+        try:
+            while not stop.is_set():
+                try:
+                    chunk = await asyncio.wait_for(stt_queue.get(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    continue
+                if chunk is None:
+                    ws = dg["ws"]
+                    if ws is not None:
+                        try:
+                            await ws.send(json.dumps({"type": "CloseStream"}))
+                        except Exception:
+                            pass
+                    stop.set()
+                    break
+                ws = dg["ws"]
+                if ws is None:
+                    # Drop audio until reconnect finishes.
+                    continue
+                try:
+                    await ws.send(chunk)
+                except Exception as e:
+                    log(f"[{ccid}] stt_sender send failed (will reconnect): {e}")
+                    try:
+                        await ws.close()
+                    except Exception:
+                        pass
+        except Exception as e:
+            log(f"[{ccid}] stt_sender error: {e}")
+            fail("stt_sender", str(e), ccid=ccid)
+
+    async def stt_keepalive():
+        # Deepgram docs: send KeepAlive at least every 10s with no audio.
+        while not stop.is_set() and not session.ended:
+            await asyncio.sleep(5)
+            ws = dg["ws"]
+            if ws is None:
+                continue
+            try:
+                await ws.send(json.dumps({"type": "KeepAlive"}))
+            except Exception:
+                pass
+
+    async def stt_receiver_loop():
+        """Receive forever; reopen Listen if Deepgram drops mid-call."""
+        reconnects = 0
+        while not stop.is_set() and not session.ended:
+            if session.media_owner != media_epoch:
+                return
+            ws = dg["ws"]
+            if ws is None:
+                try:
+                    dg["ws"] = await _open_listen(ccid, encoding, sample_rate)
+                    reconnects += 1
+                    log(f"[{ccid}] STT-only reconnected (#{reconnects})")
+                    ws = dg["ws"]
+                except Exception as e:
+                    log(f"[{ccid}] STT-only reconnect failed: {e}")
+                    fail("listen_reconnect_failed", str(e), ccid=ccid)
+                    await asyncio.sleep(1.0)
+                    continue
+
+            pending: list[str] = []
+
+            async def flush() -> None:
+                if not pending:
+                    return
+                text = " ".join(pending).strip()
+                pending.clear()
+                if text and not session.ended:
+                    await conversation.handle_user_text(session, ccid, text)
+
+            try:
+                async for message in ws:
+                    if stop.is_set() or session.ended:
+                        return
+                    if isinstance(message, bytes):
+                        continue
+                    msg = json.loads(message)
+                    mtype = msg.get("type")
+
+                    if mtype == "UtteranceEnd":
+                        log(f"[{ccid}] dg UtteranceEnd")
+                        await flush()
+                        continue
+                    if mtype != "Results":
+                        if mtype not in ("Metadata",):
+                            log(f"[{ccid}] dg {mtype}: {json.dumps(msg)[:220]}")
+                        elif msg.get("duration") == 0.0:
+                            log(
+                                f"[{ccid}] dg Metadata duration=0 "
+                                f"(idle close / incomplete) — reconnecting"
+                            )
+                        if mtype == "Error":
+                            fail(
+                                "deepgram_error",
+                                json.dumps(msg)[:400],
+                                ccid=ccid,
+                            )
+                        continue
+
+                    alts = (msg.get("channel") or {}).get("alternatives") or []
+                    if not alts:
+                        continue
+                    text = (alts[0].get("transcript") or "").strip()
+                    if not text or not msg.get("is_final"):
+                        continue
+                    log(
+                        f"[{ccid}] dg final={text!r} "
+                        f"speech_final={bool(msg.get('speech_final'))} "
+                        f"model={config.DEEPGRAM_LISTEN_MODEL}"
+                    )
+                    pending.append(text)
+                    if msg.get("speech_final"):
+                        await flush()
+            except (websockets.ConnectionClosed, WebSocketDisconnect):
+                log(f"[{ccid}] STT-only Deepgram socket closed")
+            except Exception as e:
+                log(f"[{ccid}] stt_receiver error: {e}")
+                fail("stt_receiver", str(e), ccid=ccid)
+
+            if stop.is_set() or session.ended or session.media_owner != media_epoch:
+                return
+            # Socket died while call still live — open a fresh Listen.
+            dg["ws"] = None
+            try:
+                await ws.close()
+            except Exception:
+                pass
+
+    sender_t = asyncio.create_task(stt_sender())
+    receiver_t = asyncio.create_task(stt_receiver_loop())
+    keepalive_t = asyncio.create_task(stt_keepalive())
+    try:
+        # Stay up until Telnyx media stops or the conversation engine ends.
+        # Do NOT exit just because Deepgram closed — receiver_loop reconnects.
+        while not reader.done() and not session.ended:
+            await asyncio.sleep(0.25)
+    except (WebSocketDisconnect, websockets.ConnectionClosed):
+        pass
+    except Exception as e:
+        log(f"[{ccid}] STT-only bridge error: {e}")
+        fail("bridge_error", str(e), ccid=ccid)
+    finally:
+        stop.set()
+        state["listen_open"] = False
+        try:
+            stt_queue.put_nowait(None)
+        except Exception:
+            pass
+        for t in (sender_t, receiver_t, keepalive_t, reader):
+            t.cancel()
+        ws = dg.get("ws")
+        if ws is not None:
+            try:
+                await ws.close()
+            except Exception:
+                pass
+        await close_session_stt(session)
+        log(f"[{ccid}] STT-only closed")
 
 
 async def media_bridge(telnyx_ws: WebSocket):
@@ -134,15 +373,21 @@ async def media_bridge(telnyx_ws: WebSocket):
     session.media_owner = media_epoch
     log(f"[{state['ccid']}] media owner epoch={media_epoch}")
 
-    if session.conversation_active:
+    # Campaign calls always use Telnyx playback (conversation engine). With
+    # MEDIA_STREAM on, this socket is inbound STT only — required for
+    # Deepgram models Telnyx transcription_start cannot select.
+    if session.conversation_active or config.MEDIA_STREAM:
         log(
-            f"[{state['ccid']}] media ws inbound-only "
-            "(conversation engine owns speech)"
+            f"[{state['ccid']}] media ws STT-only "
+            f"(Deepgram {config.DEEPGRAM_LISTEN_MODEL}; conversation owns speech)"
         )
-        try:
-            await reader
-        except (WebSocketDisconnect, asyncio.CancelledError):
-            pass
+        await _run_stt_only(
+            session=session,
+            state=state,
+            stt_queue=stt_queue,
+            reader=reader,
+            media_epoch=media_epoch,
+        )
         return
 
     if config.ECHO_TEST:
@@ -304,16 +549,15 @@ async def media_bridge(telnyx_ws: WebSocket):
             if session.ended or session.node == "ended":
                 return
             t_decide = time.monotonic()
-            d = conversation._quick_decision(session, text)
-            if d is None:
-                d = await decide(session.node, text, probes_used=session.probes_used)
-            d = conversation._cap_probes(session, d)
+            d = await conversation._decide_turn(session, text)
             log(
                 f"[{ccid}] decide {json.dumps(decision_log(d))} "
                 f"in {time.monotonic()-t_decide:.3f}s"
             )
 
-            if d.intent == "unclear" or d.play == ["probe_role"] or d.play == ["probe_unclear"]:
+            if d.intent in ("are_you_ai", "who_is_this", "situation_reply"):
+                pass
+            elif d.intent == "unclear" or d.play == ["probe_role"] or d.play == ["probe_unclear"]:
                 session.probes_used += 1
             else:
                 session.probes_used = 0

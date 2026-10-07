@@ -1,0 +1,51 @@
+# Secrets / local env
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtualenv
+venv/
+.venv/
+env/
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Runtime data & logs (keep directory structure if needed via .gitkeep elsewhere)
+logs/
+*.log
+data/leads.db
+data/leads.db-*
+data/calls/
+data/recordings/
+data/audio_cache/
+data/debug/
+data/inbound_dumps/
+data/*.csv
+data/*.xlsx
+
+# Local tooling
+*.pid
+.cloudflared/
+tunnel.log

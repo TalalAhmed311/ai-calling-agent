@@ -161,12 +161,62 @@ if not st.session_state.unlocked:
 
 st.title("Outbound dialer")
 st.caption(
-    f"Agent `{AGENT_URL}` · max 2 concurrent Telnyx calls · leads stored in `data/leads.db`"
+    f"Agent `{AGENT_URL}` · max 2 concurrent Telnyx calls · leads stored in `data/leads.db` · "
+    f"local call window {os.environ.get('CALL_WINDOW_START', '10:00')}–"
+    f"{os.environ.get('CALL_WINDOW_END', '14:00')}"
 )
 
-tab_upload, tab_campaigns, tab_failures = st.tabs(
-    ["Add leads", "Campaigns", "Failures"]
+tab_keyword, tab_upload, tab_campaigns, tab_failures = st.tabs(
+    ["Keyword campaign", "Add leads", "Campaigns", "Failures"]
 )
+
+with tab_keyword:
+    st.subheader("Scrape → timezone buckets → dial")
+    st.markdown(
+        """
+Type a freeform Maps-style query (e.g. `coffee shops in virginia`).  
+We scrape numbers from the Google Maps scraper, assign each lead a US timezone
+from its address, and only dial when that lead’s **local** time is inside the
+window (default **10:00–14:00**, weekdays).
+"""
+    )
+    kw = st.text_input(
+        "Search query",
+        placeholder="coffee shops in virginia",
+        key="keyword_query",
+    )
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        kw_limit = st.number_input("Lead limit", min_value=1, max_value=200, value=30)
+    with c2:
+        win_start = st.text_input("Local window start", value=os.environ.get("CALL_WINDOW_START", "10:00"))
+    with c3:
+        win_end = st.text_input("Local window end", value=os.environ.get("CALL_WINDOW_END", "14:00"))
+
+    if st.button("Start campaign", type="primary", key="start_keyword_campaign"):
+        if not (kw or "").strip():
+            st.error("Enter a search query")
+        else:
+            try:
+                camp = api(
+                    "POST",
+                    "/campaigns/from-keyword",
+                    {
+                        "query": kw.strip(),
+                        "limit": int(kw_limit),
+                        "call_window_start": win_start.strip() or "10:00",
+                        "call_window_end": win_end.strip() or "14:00",
+                        "name": kw.strip(),
+                    },
+                )
+                st.session_state.campaign_id = camp["id"]
+                st.success(
+                    f"Campaign #{camp['id']} started. "
+                    f"{camp.get('message') or 'Scraping, then dialing in-window leads.'} "
+                    "Watch the Campaigns tab for scrape progress and timezone buckets."
+                )
+            except Exception as e:
+                st.error(str(e))
 
 with tab_upload:
     mode = st.radio(
@@ -340,6 +390,19 @@ with tab_campaigns:
         m[3].metric("Completed", camp.get("completed") or 0)
         m[4].metric("Failed", camp.get("failed") or 0)
 
+        if camp.get("source") == "keyword" or camp.get("query"):
+            st.caption(
+                f"Query: `{camp.get('query') or ''}` · scrape: "
+                f"{camp.get('scrape_status') or 'n/a'} · window "
+                f"{camp.get('call_window_start') or '10:00'}–{camp.get('call_window_end') or '14:00'} local"
+            )
+            if camp.get("error"):
+                st.error(camp["error"])
+            buckets = camp.get("timezone_buckets") or []
+            if buckets:
+                st.markdown("**Timezone buckets** (dial only when *callable_now*)")
+                st.dataframe(pd.DataFrame(buckets), use_container_width=True, hide_index=True)
+
         b1, b2, b3 = st.columns(3)
         with b1:
             if st.button("Start calling", type="primary"):
@@ -365,6 +428,8 @@ with tab_campaigns:
                     "id",
                     "phone",
                     "name",
+                    "timezone",
+                    "address",
                     "status",
                     "disposition",
                     "hangup_cause",

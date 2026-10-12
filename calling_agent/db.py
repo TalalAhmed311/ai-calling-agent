@@ -79,10 +79,23 @@ def init() -> None:
                     ON situations(clip_id);
                 """
             )
-            try:
-                conn.execute("ALTER TABLE leads ADD COLUMN recording TEXT")
-            except sqlite3.OperationalError:
-                pass
+            # Additive migrations (SQLite ignores duplicates via OperationalError).
+            for stmt in (
+                "ALTER TABLE leads ADD COLUMN recording TEXT",
+                "ALTER TABLE leads ADD COLUMN timezone TEXT",
+                "ALTER TABLE leads ADD COLUMN address TEXT",
+                "ALTER TABLE campaigns ADD COLUMN source TEXT DEFAULT 'csv'",
+                "ALTER TABLE campaigns ADD COLUMN query TEXT",
+                "ALTER TABLE campaigns ADD COLUMN scrape_job_id TEXT",
+                "ALTER TABLE campaigns ADD COLUMN scrape_status TEXT",
+                "ALTER TABLE campaigns ADD COLUMN call_window_start TEXT DEFAULT '10:00'",
+                "ALTER TABLE campaigns ADD COLUMN call_window_end TEXT DEFAULT '14:00'",
+                "ALTER TABLE campaigns ADD COLUMN error TEXT",
+            ):
+                try:
+                    conn.execute(stmt)
+                except sqlite3.OperationalError:
+                    pass
             conn.commit()
         finally:
             conn.close()
@@ -231,6 +244,11 @@ def create_campaign(
     rows: list[dict[str, Any]],
     *,
     filename: str = "",
+    source: str = "csv",
+    query: str = "",
+    call_window_start: str = "10:00",
+    call_window_end: str = "14:00",
+    status: str = "idle",
 ) -> dict[str, Any]:
     init()
     now = _now()
@@ -238,9 +256,24 @@ def create_campaign(
         conn = connect()
         try:
             cur = conn.execute(
-                "INSERT INTO campaigns (name, filename, phone_column, status, created_at, updated_at) "
-                "VALUES (?, ?, ?, 'idle', ?, ?)",
-                (name, filename, phone_column, now, now),
+                """
+                INSERT INTO campaigns
+                    (name, filename, phone_column, status, created_at, updated_at,
+                     source, query, call_window_start, call_window_end)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    name,
+                    filename,
+                    phone_column,
+                    status,
+                    now,
+                    now,
+                    source,
+                    query,
+                    call_window_start,
+                    call_window_end,
+                ),
             )
             cid = int(cur.lastrowid)
             inserted = 0
@@ -251,8 +284,12 @@ def create_campaign(
                     skipped += 1
                     continue
                 conn.execute(
-                    "INSERT INTO leads (campaign_id, phone, name, fields, status, created_at, updated_at) "
-                    "VALUES (?, ?, ?, ?, 'pending', ?, ?)",
+                    """
+                    INSERT INTO leads
+                        (campaign_id, phone, name, fields, status, created_at, updated_at,
+                         timezone, address)
+                    VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?)
+                    """,
                     (
                         cid,
                         phone,
@@ -260,6 +297,8 @@ def create_campaign(
                         json.dumps(row.get("fields") or {}, ensure_ascii=False),
                         now,
                         now,
+                        (row.get("timezone") or None),
+                        (row.get("address") or None),
                     ),
                 )
                 inserted += 1
@@ -271,6 +310,65 @@ def create_campaign(
     camp["inserted"] = inserted
     camp["skipped"] = skipped
     return camp
+
+
+def create_empty_keyword_campaign(
+    *,
+    name: str,
+    query: str,
+    call_window_start: str = "10:00",
+    call_window_end: str = "14:00",
+) -> dict[str, Any]:
+    """Campaign shell while scrape runs (status=scraping)."""
+    return create_campaign(
+        name=name,
+        phone_column="phone_number",
+        rows=[],
+        filename=query,
+        source="keyword",
+        query=query,
+        call_window_start=call_window_start,
+        call_window_end=call_window_end,
+        status="scraping",
+    )
+
+
+def add_leads_to_campaign(campaign_id: int, rows: list[dict[str, Any]]) -> dict[str, int]:
+    init()
+    now = _now()
+    inserted = 0
+    skipped = 0
+    with _LOCK:
+        conn = connect()
+        try:
+            for row in rows:
+                phone = normalize_phone(str(row.get("phone") or ""))
+                if not phone:
+                    skipped += 1
+                    continue
+                conn.execute(
+                    """
+                    INSERT INTO leads
+                        (campaign_id, phone, name, fields, status, created_at, updated_at,
+                         timezone, address)
+                    VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?)
+                    """,
+                    (
+                        campaign_id,
+                        phone,
+                        (row.get("name") or "")[:120] or None,
+                        json.dumps(row.get("fields") or {}, ensure_ascii=False),
+                        now,
+                        now,
+                        (row.get("timezone") or None),
+                        (row.get("address") or None),
+                    ),
+                )
+                inserted += 1
+            conn.commit()
+        finally:
+            conn.close()
+    return {"inserted": inserted, "skipped": skipped}
 
 
 def list_campaigns() -> list[dict[str, Any]]:
@@ -348,31 +446,100 @@ def list_leads(campaign_id: int, limit: int = 500) -> list[dict[str, Any]]:
 
 
 def claim_next_lead() -> dict[str, Any] | None:
-    """Atomically take one pending lead from a running campaign."""
+    """Atomically take one pending lead that is inside its local call window.
+
+    Leads whose local time is outside the campaign window stay ``pending`` and
+    are skipped until their timezone bucket opens (e.g. 10:00–14:00 local).
+    """
+    from calling_agent.timezone_us import is_within_local_window
+
     now = _now()
     with _LOCK:
         conn = connect()
         try:
-            row = conn.execute(
+            rows = conn.execute(
                 """
-                SELECT l.* FROM leads l
+                SELECT l.*,
+                       c.call_window_start AS call_window_start,
+                       c.call_window_end AS call_window_end
+                FROM leads l
                 JOIN campaigns c ON c.id = l.campaign_id
                 WHERE c.status='running' AND l.status='pending'
                 ORDER BY l.id ASC
-                LIMIT 1
+                LIMIT 80
                 """
-            ).fetchone()
-            if row is None:
+            ).fetchall()
+            chosen = None
+            for row in rows:
+                d = _row(row) or {}
+                start = str(d.get("call_window_start") or "10:00")
+                end = str(d.get("call_window_end") or "14:00")
+                tz = d.get("timezone")
+                # CSV campaigns with no timezone: allow dial (legacy behaviour).
+                if tz and not is_within_local_window(str(tz), start=start, end=end):
+                    continue
+                if not tz:
+                    # Prefer timezone-enriched leads; only dial unknown if no
+                    # windowed lead is ready in this batch.
+                    if chosen is None:
+                        chosen = d
+                    continue
+                chosen = d
+                break
+            if chosen is None:
                 return None
+            lead_id = int(chosen["id"])
             conn.execute(
                 "UPDATE leads SET status='dialing', attempts=attempts+1, updated_at=? WHERE id=?",
-                (now, row["id"]),
+                (now, lead_id),
             )
             conn.commit()
-            claimed = conn.execute("SELECT * FROM leads WHERE id=?", (row["id"],)).fetchone()
+            claimed = conn.execute("SELECT * FROM leads WHERE id=?", (lead_id,)).fetchone()
             return _row(claimed)
         finally:
             conn.close()
+
+
+def timezone_bucket_stats(campaign_id: int) -> list[dict[str, Any]]:
+    """Pending leads grouped by timezone + whether that bucket is callable now."""
+    from calling_agent.timezone_us import is_within_local_window
+
+    camp = get_campaign(campaign_id)
+    if not camp:
+        return []
+    start = str(camp.get("call_window_start") or "10:00")
+    end = str(camp.get("call_window_end") or "14:00")
+    conn = connect()
+    try:
+        rows = conn.execute(
+            """
+            SELECT COALESCE(timezone, 'unknown') AS timezone,
+                   COUNT(*) AS pending
+            FROM leads
+            WHERE campaign_id=? AND status='pending'
+            GROUP BY COALESCE(timezone, 'unknown')
+            ORDER BY pending DESC
+            """,
+            (campaign_id,),
+        ).fetchall()
+    finally:
+        conn.close()
+    out = []
+    for r in rows:
+        tz = str(r["timezone"] or "unknown")
+        callable_now = (
+            False
+            if tz == "unknown"
+            else is_within_local_window(tz, start=start, end=end)
+        )
+        out.append(
+            {
+                "timezone": tz,
+                "pending": int(r["pending"] or 0),
+                "callable_now": callable_now,
+            }
+        )
+    return out
 
 
 def count_dialing() -> int:

@@ -209,3 +209,16 @@ DUMP_INBOUND_AUDIO = os.environ.get("DUMP_INBOUND_AUDIO", "").strip() in (
     "yes",
 )
 DEBUG_DIR = DATA_DIR / "debug"
+
+# Keyword → scrape → timezone dialer
+SCRAPER_URL = os.environ.get("SCRAPER_URL", "http://127.0.0.1:8000").strip().rstrip("/")
+SCRAPER_VERSION = os.environ.get("SCRAPER_VERSION", "v2").strip() or "v2"
+SCRAPE_TIMEOUT_S = float(os.environ.get("SCRAPE_TIMEOUT_S", "1800"))
+# Local civil-time call window (per lead timezone).
+CALL_WINDOW_START = os.environ.get("CALL_WINDOW_START", "10:00").strip() or "10:00"
+CALL_WINDOW_END = os.environ.get("CALL_WINDOW_END", "14:00").strip() or "14:00"
+CALL_WEEKDAYS_ONLY = os.environ.get("CALL_WEEKDAYS_ONLY", "1").strip() in (
+    "1",
+    "true",
+    "yes",
+)

@@ -59,8 +59,10 @@ async def _loop() -> None:
 
             nxt = db.claim_next_lead()
             if nxt is None:
+                # Either nothing left, or all pending leads are outside their
+                # local 10–2 window — wait and retry without burning the CPU.
                 db.mark_campaigns_done()
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(5.0)
                 continue
 
             lead_payload = {
